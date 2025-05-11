@@ -12,7 +12,7 @@ BASE_URL = "https://dumps.wikimedia.org/other/pageviews"
 YEAR = 2024
 MONTH = 5
 DAY = 1
-HOURS = range(0, 1)  
+HOURS = range(0, 2)  
 OUTPUT_CSV = "data.csv"
 CHUNK_SIZE = 100000  
 
@@ -57,16 +57,11 @@ def safe_remove(filepath):
     else:
         print(f"⚠️ Skipped delete: {filepath} not found")
 
-def generate_unique_id(row):
-    """Generate a unique ID based on the row data"""
-    # Create a string by combining multiple columns to ensure uniqueness
-    unique_string = f"{row['country']}_{row['device']}_{row['title']}_{row['timestamp']}_{row['hour']}"
-    # Create a hash of this string to get a fixed-length ID
-    return hashlib.md5(unique_string.encode()).hexdigest()
 
 # ---------- PIPELINE ----------
 first_chunk = True
 row_count = 0  # Global counter for all rows
+data_dict = {}  # Dictionary to store the data
 
 for hour in HOURS:
     hour_str = f"{hour:02d}"
@@ -109,26 +104,21 @@ for hour in HOURS:
 
             # Filter out bad rows
             chunk = chunk[(chunk['country'] != "nan") & (chunk['title'] != "nan") & (chunk['device'] != "nan")]
-            chunk = chunk[(chunk['country'].str.len() > 0) & (chunk['title'].str.len() > 0)]
+            chunk = chunk[(chunk['country'].str.len() > 0) & (chunk['title'].str.len() > 0) & (chunk['device'].str.len() > 0)]
 
             # Add timestamp and hour
             chunk['timestamp'] = timestamp
             chunk['hour'] = hour_value
-            
-            # Add unique IDs
-            # Method 1: Generate deterministic IDs based on content
-            chunk['id'] = chunk.apply(generate_unique_id, axis=1)
-            
-            # Method 2: Alternative - use sequential IDs
-            # chunk['id'] = range(row_count, row_count + len(chunk))
-            # row_count += len(chunk)
 
-            # Keep only needed columns
-            chunk = chunk[['id', 'country', 'device', 'title', 'timestamp', 'hour']]
-
-            # Write to CSV
-            chunk.to_csv(OUTPUT_CSV, mode='w' if first_chunk else 'a', header=first_chunk, index=False)
-            first_chunk = False
+            # Process each row and add to the dictionary
+            for _, row in chunk.iterrows():
+                key = row['country'] + ':' + row['device'] + ':' + row['title']
+                value = str(row['timestamp']) + ':' + str(row['hour']) + ':' + str(row['views']) + ':' + str(row['extra'])
+                
+                if key in data_dict:
+                    data_dict[key].append(value)
+                else:
+                    data_dict[key] = [value]
 
     except Exception as e:
         print(f"❌ Error processing {local_txt}: {e}")
@@ -136,5 +126,15 @@ for hour in HOURS:
     # Step 5: Cleanup
     safe_remove(local_gz)
     safe_remove(local_txt)
+
+# Write dictionary to CSV with unique keys
+with open(OUTPUT_CSV, 'w') as f:
+    f.write("key,values\n")  # Changed column name to 'values' to reflect multiple values
+    for key, values in data_dict.items():
+        # Convert the list of values to a string with a custom separator
+        values_str = "|".join([str(v) for v in values]).replace(',', ';')  # Replace commas with semicolons
+        f.write(f"{key},{values_str}\n")
+
+print(f"✅ Processed data with unique keys saved to {OUTPUT_CSV}")
 
 
