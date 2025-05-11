@@ -4,14 +4,16 @@ import gzip
 import shutil
 import os
 import re
+import uuid
+import hashlib
 
 # ---------- CONFIGURATION ----------
 BASE_URL = "https://dumps.wikimedia.org/other/pageviews"
 YEAR = 2024
 MONTH = 5
 DAY = 1
-HOURS = range(0, 5)  
-OUTPUT_CSV = "pageviews.csv"
+HOURS = range(0, 1)  
+OUTPUT_CSV = "data.csv"
 CHUNK_SIZE = 100000  
 
 # ---------- HELPERS ----------
@@ -55,8 +57,16 @@ def safe_remove(filepath):
     else:
         print(f"⚠️ Skipped delete: {filepath} not found")
 
+def generate_unique_id(row):
+    """Generate a unique ID based on the row data"""
+    # Create a string by combining multiple columns to ensure uniqueness
+    unique_string = f"{row['country']}_{row['device']}_{row['title']}_{row['timestamp']}_{row['hour']}"
+    # Create a hash of this string to get a fixed-length ID
+    return hashlib.md5(unique_string.encode()).hexdigest()
+
 # ---------- PIPELINE ----------
 first_chunk = True
+row_count = 0  # Global counter for all rows
 
 for hour in HOURS:
     hour_str = f"{hour:02d}"
@@ -104,9 +114,17 @@ for hour in HOURS:
             # Add timestamp and hour
             chunk['timestamp'] = timestamp
             chunk['hour'] = hour_value
+            
+            # Add unique IDs
+            # Method 1: Generate deterministic IDs based on content
+            chunk['id'] = chunk.apply(generate_unique_id, axis=1)
+            
+            # Method 2: Alternative - use sequential IDs
+            # chunk['id'] = range(row_count, row_count + len(chunk))
+            # row_count += len(chunk)
 
             # Keep only needed columns
-            chunk = chunk[['country', 'device', 'title', 'timestamp', 'hour']]
+            chunk = chunk[['id', 'country', 'device', 'title', 'timestamp', 'hour']]
 
             # Write to CSV
             chunk.to_csv(OUTPUT_CSV, mode='w' if first_chunk else 'a', header=first_chunk, index=False)

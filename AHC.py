@@ -444,28 +444,104 @@ class ACHSystem:
         self.server_store.pop(hashed_server_id, None)
         
         return records_to_migrate
+    
+import pandas as pd
+from AHC import ACHSystem
+import argparse
+
+def main():
+    parser = argparse.ArgumentParser(description='Embed and store data using AHC system')
+    parser.add_argument('--input', type=str, default='data.csv', help='Input CSV file path')
+    parser.add_argument('--config', type=str, default='config.json', help='AHC system config file')
+    parser.add_argument('--num_servers', type=int, default=3, help='Number of servers (if no config)')
+    parser.add_argument('--total_capacity', type=int, default=1000, help='Total capacity (if no config)')
+    parser.add_argument('--k_clusters', type=int, default=2, help='Number of clusters (if no config)')
+    parser.add_argument('--replicas', type=int, default=3, help='Number of replicas (if no config)')
+    parser.add_argument('--batch_size', type=int, default=1000, help='Batch size for processing')
+    parser.add_argument('--max_records', type=int, default=None, help='Maximum number of records to store')
+    args = parser.parse_args()
+
+    # Initialize AHC system
+    try:
+        # Try to load existing configuration
+        print(f"Attempting to load existing AHC configuration from {args.config}")
+        ach = ACHSystem(num_servers=1, total_capacity=1, k_clusters=1)  # Placeholder values
+        ach.load_config(args.config)
+        print("Successfully loaded existing configuration")
+    except FileNotFoundError:
+        # Create new system if config doesn't exist
+        print(f"No existing configuration found. Creating new AHC system with {args.num_servers} servers")
+        ach = ACHSystem(
+            num_servers=args.num_servers, 
+            total_capacity=args.total_capacity, 
+            k_clusters=args.k_clusters,
+            replicas=args.replicas
+        )
+        
+        # We need to initialize the system by running k-means on some data
+        # and building the virtual node rings
+        print("Reading initial batch of data for clustering...")
+        df = pd.read_csv(args.input)
+        sample_data = df.head(min(1000, len(df)))
+        
+        # Extract text for embedding (country, device, title)
+        # Format as simple string for embedding
+        text_data = sample_data.apply(
+            lambda row: f"{row['country']} {row['device']} {row['title']}", 
+            axis=1
+        ).tolist()
+        
+        # Run clustering to initialize the system
+        print("Generating embeddings and clustering...")
+        embeddings = ach.embed_keys(text_data)
+        ach.run_kmeans(embeddings)
+        
+        # Build and assign virtual nodes
+        print("Building virtual node rings...")
+        ach.build_vnode_rings()
+        ach.assign_vnodes_hrw()
+        
+        # Save the initial configuration
+        ach.save_config(args.config)
+        print(f"Saved initial configuration to {args.config}")
+
+    # Process the CSV file in batches
+    print(f"Processing data from {args.input}...")
+    stored_count = 0
+    
+    # If max_records is set, limit the amount of data to process
+    for chunk in pd.read_csv(args.input, chunksize=args.batch_size):
+        for idx, row in chunk.iterrows():
+            # Skip if we've reached the maximum number of records
+            if args.max_records is not None and stored_count >= args.max_records:
+                break
+                
+            # Get ID from the first column
+            record_id = row['id']
+            
+            # Combine fields to create the text for embedding
+            text_value = f"{row['country']} {row['device']} {row['title']}"
+            
+            # Store the data using the AHC system
+            ach.store(record_id, text_value)
+            stored_count += 1
+            
+            # Show progress
+            if stored_count % 1000 == 0:
+                print(f"Stored {stored_count} records")
+                
+        # Break the outer loop too if we've reached the limit
+        if args.max_records is not None and stored_count >= args.max_records:
+            print(f"Reached maximum number of records ({args.max_records})")
+            break
+    
+    # Save the final state of the system
+    ach.save_config(args.config)
+    print(f"Completed storing {stored_count} records")
+    print(f"Final configuration saved to {args.config}")
 
 if __name__ == "__main__":
-    # Initialize the system
-    ach = ACHSystem(num_servers=3, total_capacity=1000, k_clusters=2, replicas=3)
+    main() 
+
+
     
-    # Create sample data and embeddings
-    sample_data = ["This is a test", "Another test document", "Hello world", "Sample text for clustering"]
-    embeddings = ach.embed_keys(sample_data)
-    
-    # Run k-means to generate centroids
-    ach.run_kmeans(embeddings)
-    
-    # Build and assign virtual nodes
-    ach.build_vnode_rings()
-    ach.assign_vnodes_hrw()
-    
-    # Now we can store data
-    ach.store("test", "test")
-    
-    # Save and load configuration
-    ach.save_config("config.json")
-    ach.load_config("config.json")
-    
-    # Print server store for verification
-    print(ach.server_store)
