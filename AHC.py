@@ -6,7 +6,6 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
 
-
 class ACHSystem:
     def __init__(self, num_servers, total_capacity, k_clusters, replicas=100, model_name='all-MiniLM-L6-v2'):
         """
@@ -143,6 +142,7 @@ class ACHSystem:
         # Store the record
         record = {'key': key, 'value': value, 'cluster': cluster_id, 'vnode': vnode_id, 'hash': key_hash}
         self.server_store[server_id].append(record)
+        return server_id
 
     def get(self, key):
         """
@@ -241,210 +241,226 @@ class ACHSystem:
 
         Input:
             capacity (int): The capacity of the new server
-            
+
         Output:
             Dictionary mapping affected old vnodes to new vnodes for data migration
         """
-        # Add the new server to the list of servers
+        # Add the new server
         new_server_id = self._hash(str(len(self.servers)))
         self.servers.append(new_server_id)
         self.original_server_ids.append(len(self.original_server_ids))
-        
-        # Update the weights
+
+        # Update weights and initialize storage
         self.weights[new_server_id] = capacity
-        
-        # Initialize server storage for the new server
         self.server_store[new_server_id] = []
 
-        # Store all new vnodes that will be added to each cluster
+        # Prepare new vnodes per cluster
         new_vnodes_by_cluster = {cid: [] for cid in range(self.k_clusters)}
-        
-        # Create new virtual nodes for each cluster
         for cid in range(self.k_clusters):
             for i in range(self.replicas):
                 new_vnode = self._hash(f"{cid}:{new_server_id}:{i}")
                 new_vnodes_by_cluster[cid].append(new_vnode)
-        
-        # Track affected old vnodes and their information
+
         affected_vnodes = {}
-        
+        # Assign each new vnode via HRW and insert into ring
         for cid, new_vnodes in new_vnodes_by_cluster.items():
-            # Get a copy of the current ring before adding new vnodes
+            # Copy current ring
             current_ring = self.vnode_rings[cid].copy()
-            
+
             for new_vnode in new_vnodes:
-                # Find where the new vnode would be inserted
+                # HRW assignment: pick server with highest score
+                best_server, best_score = None, float('-inf')
+                for sid in self.servers:
+                    score = self._hash(f"{new_vnode}:{sid}") * self.weights[sid]
+                    if score > best_score:
+                        best_score, best_server = score, sid
+                self.vnode_to_server[new_vnode] = best_server
+
+                # Find affected old vnode (consistent-ring split logic)
                 idx = bisect.bisect_right(current_ring, new_vnode)
-                
-                # The affected vnode is the one that follows the position where new_vnode would be inserted
                 if idx < len(current_ring):
-                    affected_old_vnode = current_ring[idx]
-                elif len(current_ring) > 0:  # If insertion point is at the end, the first vnode is affected
-                    affected_old_vnode = current_ring[0]
+                    old_vnode = current_ring[idx]
+                elif current_ring:
+                    old_vnode = current_ring[0]
                 else:
-                    continue  # No existing vnodes in this cluster
-                
-                # Get the server for the affected old vnode
-                old_server = self.vnode_to_server.get(affected_old_vnode)
-                
+                    continue
+
+                old_server = self.vnode_to_server.get(old_vnode)
                 if old_server is not None:
-                    # Store the affected vnode information
-                    affected_vnodes[affected_old_vnode] = {
+                    affected_vnodes[old_vnode] = {
                         'new_vnode': new_vnode,
                         'old_server': old_server,
-                        'new_server': new_server_id,
+                        'new_server': best_server,
                         'cluster': cid
                     }
-                
-                # Directly assign this new vnode to the new server (no HRW needed)
-                self.vnode_to_server[new_vnode] = new_server_id
-            
-            # Now add the new vnodes to the ring
-            for new_vnode in new_vnodes:
+
+                # Insert and sort
                 self.vnode_rings[cid].append(new_vnode)
-            
-            # Sort the ring after adding all new vnodes
             self.vnode_rings[cid].sort()
-        
-        # Migrate data from affected old vnodes to new vnodes
+
+        # Migrate records for affected vnodes
         for old_vnode, info in affected_vnodes.items():
             old_server = info['old_server']
             new_vnode = info['new_vnode']
             new_server = info['new_server']
             cluster_id = info['cluster']
-            
-            # Find records on the old server that need to be moved
-            records_to_move = []
-            records_to_keep = []
-            
-            # Loop through all records in the old server
+
+            records_to_move, records_to_keep = [], []
             for record in self.server_store[old_server]:
-                # Check if this record is associated with the affected vnode
                 if record['vnode'] == old_vnode:
-                    # Get the key hash
                     key_hash = record['hash']
-                    
-                    # Check if this key should now hash to the new vnode
-                    # by finding its position in the updated ring
                     vnode_ids = self.vnode_rings[cluster_id]
-                    idx = bisect.bisect_right(vnode_ids, key_hash)
-                    if idx == len(vnode_ids):
-                        idx = 0
-                    target_vnode = vnode_ids[idx]
-                    
-                    # If this key should now be stored on the new vnode
-                    if target_vnode == new_vnode:
-                        # Update the record's vnode reference
+                    i = bisect.bisect_right(vnode_ids, key_hash)
+                    if i == len(vnode_ids): i = 0
+                    if vnode_ids[i] == new_vnode:
                         record['vnode'] = new_vnode
-                        # Add to the list of records to move
                         records_to_move.append(record)
                     else:
-                        # Keep it on the current server
                         records_to_keep.append(record)
                 else:
-                    # This record is not associated with the affected vnode
                     records_to_keep.append(record)
-            
-            # Move records to the new server
+
+            # Perform migration
             self.server_store[new_server].extend(records_to_move)
-            
-            # Update the old server to only keep relevant records
             self.server_store[old_server] = records_to_keep
-        
+
         return affected_vnodes
+
 
     def remove_server(self, server_id_to_remove):
         """
-        Remove a server from the system and migrate its data to appropriate servers.
-        
+        Remove a server from the system, reassign its v-nodes via HRW, and migrate data.
+
         Input:
-            server_id_to_remove: The ID of the server to remove (original/unhashed ID)
-            
+            server_id_to_remove: The original or hashed ID of the server to remove
         Output:
-            Dictionary mapping removed vnodes to their new target vnodes
+            Mapping from each removed vnode to its new assigned server
         """
+        # Prevent removing the last server
         if len(self.servers) <= 1:
             raise ValueError("Cannot remove the last server from the system")
-            
-        # Convert original ID to hashed server ID if needed
+
+        # Resolve hashed ID if original ID given
         if isinstance(server_id_to_remove, int) and server_id_to_remove in self.original_server_ids:
             idx = self.original_server_ids.index(server_id_to_remove)
             hashed_server_id = self.servers[idx]
         else:
             hashed_server_id = server_id_to_remove
-            
         if hashed_server_id not in self.servers:
             raise ValueError(f"Server {server_id_to_remove} not found in the system")
-            
-        # Find all vnodes that belong to this server
-        removed_vnodes = {}
+
+        # Identify v-nodes owned by this server
+        removed_vnodes = []
         for cid in range(self.k_clusters):
-            removed_vnodes[cid] = []
-            for vnode_id in self.vnode_rings[cid]:
-                if self.vnode_to_server.get(vnode_id) == hashed_server_id:
-                    removed_vnodes[cid].append(vnode_id)
-        
-        # Create a copy of the current state before we modify anything
-        current_vnode_rings = {cid: self.vnode_rings[cid].copy() for cid in range(self.k_clusters)}
-        
-        # Track which records need to be migrated to which servers
-        records_to_migrate = {}  # target_server -> [records]
-        
-        # Process all records on the server to be removed
-        for record in self.server_store[hashed_server_id]:
-            cluster_id = record['cluster']
-            key_hash = record['hash']
-            
-            # Create a copy of the vnode ring without the server's vnodes
-            new_ring = [v for v in current_vnode_rings[cluster_id] 
-                        if self.vnode_to_server.get(v) != hashed_server_id]
-            
-            if not new_ring:
-                # If there are no other vnodes in this cluster, we can't migrate
-                # This is an error state that should be prevented
-                raise ValueError(f"No target servers available in cluster {cluster_id}")
-            
-            # Find where this key would hash in the new ring
-            idx = bisect.bisect_right(new_ring, key_hash)
-            if idx == len(new_ring):
-                idx = 0
-                
-            # Get the target vnode and server
-            target_vnode = new_ring[idx]
-            target_server = self.vnode_to_server[target_vnode]
-            
-            # Update the record's vnode
-            record['vnode'] = target_vnode
-            
-            # Add to migration list
-            if target_server not in records_to_migrate:
-                records_to_migrate[target_server] = []
-            records_to_migrate[target_server].append(record)
-        
-        # Perform the actual migration
-        for target_server, records in records_to_migrate.items():
-            self.server_store[target_server].extend(records)
-            
-        # Remove all vnodes belonging to this server from the rings
-        for cid in range(self.k_clusters):
-            self.vnode_rings[cid] = [v for v in self.vnode_rings[cid] 
-                                    if self.vnode_to_server.get(v) != hashed_server_id]
-            
-        # Remove the server's vnodes from vnode_to_server mapping
-        self.vnode_to_server = {k: v for k, v in self.vnode_to_server.items() 
-                               if v != hashed_server_id}
-            
-        # Update servers list and original_server_ids
-        idx = self.servers.index(hashed_server_id)
-        self.servers.pop(idx)
-        self.original_server_ids.pop(idx)
-        
- 
-        # Clear the server store for the removed server
+            for vnode in self.vnode_rings[cid]:
+                if self.vnode_to_server.get(vnode) == hashed_server_id:
+                    removed_vnodes.append(vnode)
+
+        # Reassign each removed vnode via HRW among remaining servers
+        vnode_reassign = {}
+        for vnode in removed_vnodes:
+            best_server, best_score = None, float('-inf')
+            for sid in self.servers:
+                if sid == hashed_server_id:
+                    continue
+                score = self._hash(f"{vnode}:{sid}") * self.weights.get(sid, 1)
+                if score > best_score:
+                    best_score, best_server = score, sid
+            vnode_reassign[vnode] = best_server
+            self.vnode_to_server[vnode] = best_server
+
+        # Migrate records from removed server to new servers
+        records_to_migrate = {}  # new_server -> list of records
+        for record in self.server_store.get(hashed_server_id, []):
+            vnode = record.get('vnode')
+            new_server = vnode_reassign.get(vnode)
+            if new_server is None:
+                continue
+            record['vnode'] = vnode
+            records_to_migrate.setdefault(new_server, []).append(record)
+
+        for new_srv, recs in records_to_migrate.items():
+            self.server_store.setdefault(new_srv, []).extend(recs)
+
+        # Remove the old server from system lists
+        # use original index to remove both in sync
+        orig_idx = self.servers.index(hashed_server_id)
+        self.servers.pop(orig_idx)
+        self.original_server_ids.pop(orig_idx)
         self.server_store.pop(hashed_server_id, None)
-        
-        return records_to_migrate
+        # weights can also be removed
+        self.weights.pop(hashed_server_id, None)
+
+        return vnode_reassign
     
+    def split_vnode(self, cluster_id, vnode_id):
+        """
+        Split an overloaded vnode into two sub-vnodes via k=2 k-means.
+
+        Steps (per ACH.pdf):
+        1. Gather embeddings for all keys in vnode_id.
+        2. Run k=2 k-means to get two subclusters.
+        3. Create sub-vnode X1 -> original server, X2 -> next-best server via HRW.
+        4. Update ring: replace vnode_id with X1 and X2.
+        5. Migrate only keys in cluster2 to X2.
+        """
+        # 1. Identify records in this vnode and their embeddings
+        orig_server = self.vnode_to_server[vnode_id]
+        records = [rec for rec in self.server_store[orig_server] if rec['vnode'] == vnode_id]
+        if not records:
+            return {}
+        keys = [rec['key'] for rec in records]
+        values = [rec['value'] for rec in records]
+        embs = self.embedder.encode(values, convert_to_numpy=True)
+
+        # 2. k=2 k-means
+        km = KMeans(n_clusters=2, random_state=42, n_init=10)
+        labels = km.fit_predict(embs)
+
+        # 3. Create sub-vnodes
+        x1 = self._hash(f"split:{vnode_id}:1")
+        x2 = self._hash(f"split:{vnode_id}:2")
+        # Assign X1 to original server
+        self.vnode_to_server[x1] = orig_server
+        # Temporarily zero out orig weight for X2
+        orig_w = self.weights[orig_server]
+        self.weights[orig_server] = 0
+        # HRW for X2
+        best = None; best_score = float('-inf')
+        for sid, w in self.weights.items():
+            score = self._hash(f"{x2}:{sid}") * w
+            if score > best_score:
+                best_score, best = score, sid
+        self.weights[orig_server] = orig_w
+        self.vnode_to_server[x2] = best
+
+        # 4. Update ring
+        ring = self.vnode_rings[cluster_id]
+        # remove original vnode
+        ring.remove(vnode_id)
+        # add sub-vnodes
+        ring.extend([x1, x2])
+        ring.sort()
+
+        # 5. Migrate C2 keys
+        migrated = {}
+        new_store = []
+        for rec, lbl in zip(records, labels):
+            if lbl == 0:
+                # cluster1 -> X1, stays
+                rec['vnode'] = x1
+                continue
+            # cluster2 -> X2, move
+            rec['vnode'] = x2
+            migrated.setdefault(best, []).append(rec)
+        # filter original server store
+        self.server_store[orig_server] = [rec for rec in self.server_store[orig_server] if rec['vnode'] != x2]
+        # add to new server
+        self.server_store.setdefault(best, []).extend(migrated.get(best, []))
+
+        return {'vnode': vnode_id, 'sub1': x1, 'sub2': x2, 'new_server': best}
+
+'''
 import pandas as pd
 from AHC import ACHSystem
 import argparse
@@ -542,6 +558,6 @@ def main():
 
 if __name__ == "__main__":
     main() 
-
+'''
 
     

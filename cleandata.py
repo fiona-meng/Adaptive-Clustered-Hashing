@@ -6,6 +6,8 @@ import os
 import re
 import uuid
 import hashlib
+import csv
+import random
 
 # ---------- CONFIGURATION ----------
 BASE_URL = "https://dumps.wikimedia.org/other/pageviews"
@@ -14,7 +16,9 @@ MONTH = 5
 DAY = 1
 HOURS = range(0, 2)  
 OUTPUT_CSV = "data.csv"
-CHUNK_SIZE = 100000  
+CHUNK_SIZE = 100000
+SAMPLE_SIZE = 100000
+RANDOM_SEED = 42 
 
 # ---------- HELPERS ----------
 def download_file(url, local_path):
@@ -29,6 +33,7 @@ def download_file(url, local_path):
         return False
     return True
 
+
 def extract_gzip(gzip_path, extracted_path):
     print(f"📦 Extracting {gzip_path}")
     try:
@@ -40,6 +45,7 @@ def extract_gzip(gzip_path, extracted_path):
         return False
     return True
 
+
 def extract_timestamp_and_hour(filename):
     match = re.search(r'pageviews-(\d{4})(\d{2})(\d{2})-(\d{2})', filename)
     if match:
@@ -49,6 +55,7 @@ def extract_timestamp_and_hour(filename):
         return timestamp, hour_int
     else:
         raise ValueError(f"❌ Cannot extract timestamp from {filename}")
+
 
 def safe_remove(filepath):
     if os.path.exists(filepath):
@@ -114,7 +121,6 @@ for hour in HOURS:
             for _, row in chunk.iterrows():
                 key = row['country'] + ':' + row['device'] + ':' + row['title']
                 value = str(row['timestamp']) + ':' + str(row['hour']) + ':' + str(row['views']) + ':' + str(row['extra'])
-                
                 if key in data_dict:
                     data_dict[key].append(value)
                 else:
@@ -127,14 +133,26 @@ for hour in HOURS:
     safe_remove(local_gz)
     safe_remove(local_txt)
 
-# Write dictionary to CSV with unique keys
-with open(OUTPUT_CSV, 'w') as f:
-    f.write("key,values\n")  # Changed column name to 'values' to reflect multiple values
-    for key, values in data_dict.items():
-        # Convert the list of values to a string with a custom separator
-        values_str = "|".join([str(v) for v in values]).replace(',', ';')  # Replace commas with semicolons
-        f.write(f"{key},{values_str}\n")
+'''
+random.seed(RANDOM_SEED)
+all_keys = list(data_dict.keys())
+if len(all_keys) > SAMPLE_SIZE:
+    sampled_keys = random.sample(all_keys, SAMPLE_SIZE)
+else:
+    sampled_keys = all_keys
+'''
+all_keys = list(data_dict.keys())
+sampled_keys = all_keys
+
+with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
+    writer = csv.writer(f)
+    writer.writerow(['key', 'values'])
+    for key in sampled_keys:
+        vals = data_dict[key]
+        values_str = '|'.join(map(str, vals)).replace(',', ';')
+        # Sanitize non-UTF8 characters
+        safe_key = key.encode('utf-8', errors='ignore').decode('utf-8')
+        safe_values = values_str.encode('utf-8', errors='ignore').decode('utf-8')
+        writer.writerow([safe_key, safe_values])
 
 print(f"✅ Processed data with unique keys saved to {OUTPUT_CSV}")
-
-
